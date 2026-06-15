@@ -1,0 +1,6 @@
+# transient conversion artifacts
+*.partial.mov
+
+# editor/OS cruft
+.DS_Store
+*.swp

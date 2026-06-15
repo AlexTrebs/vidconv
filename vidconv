@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+#
+# vidconv — batch-convert video into editing codecs (DNxHR / ProRes / H.264) as .mov.
+# Built for NLE workflows (e.g. DaVinci Resolve) where HEVC sources don't cut well.
+#
+#   vidconv [--codec dnxhr|h264|prores] [--profile P] [-o OUTDIR]
+#           [--min-free GB] [--no-hwaccel] [-f] [-n] <file|dir>...
+#
+# Originals are never modified. Existing .mov outputs are skipped (use -f to overwrite).
+
+set -uo pipefail
+
+# ---- defaults ---------------------------------------------------------------
+CODEC=dnxhr
+PROFILE=""            # resolved per-codec below if empty
+OUTDIR=""             # empty = alongside source
+MIN_FREE_GB=25
+HWACCEL=1
+FORCE=0
+DRYRUN=0
+
+prog=${0##*/}
+
+usage() {
+  cat <<EOF
+$prog — batch-convert video into editing codecs (.mov) for NLEs.
+
+USAGE
+  $prog [options] <file|dir>...
+
+  Directories are scanned non-recursively for .mp4/.mov/.mkv/.m4v sources.
+  Files already having a .mov output are skipped unless -f.
+
+OPTIONS
+  -c, --codec   CODEC   dnxhr (default) | prores | h264
+  -p, --profile P       codec quality (see below)
+  -o, --outdir  DIR     write outputs here (default: alongside each source)
+      --min-free GB     stop before free space drops below this (default: $MIN_FREE_GB)
+      --no-hwaccel      disable NVDEC/CUDA decode (use software)
+  -f, --force           overwrite existing .mov outputs
+  -n, --dry-run         show what would happen, convert nothing
+  -h, --help            this help
+
+PROFILES
+  dnxhr   lb (default) | sq | hq          DNxHR, yuv422p, .mov
+  prores  proxy (default) | lt | standard | hq   ProRes (prores_ks), yuv422p10le
+  h264    CRF value, default 18 (lower = better/bigger)   libx264, yuv420p
+
+EXAMPLES
+  $prog .                       convert every source in the current dir (DNxHR LB)
+  $prog *.mp4                   convert these files
+  $prog --codec prores -p hq shoot/
+  $prog -o ~/edit --codec h264 -p 16 clip.mp4
+EOF
+}
+
+die() { printf '%s: error: %s\n' "$prog" "$*" >&2; exit 1; }
+
+# ---- arg parsing ------------------------------------------------------------
+INPUTS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -c|--codec)    CODEC="${2:-}"; shift 2 ;;
+    -p|--profile)  PROFILE="${2:-}"; shift 2 ;;
+    -o|--outdir)   OUTDIR="${2:-}"; shift 2 ;;
+    --min-free)    MIN_FREE_GB="${2:-}"; shift 2 ;;
+    --no-hwaccel)  HWACCEL=0; shift ;;
+    -f|--force)    FORCE=1; shift ;;
+    -n|--dry-run)  DRYRUN=1; shift ;;
+    -h|--help)     usage; exit 0 ;;
+    --)            shift; while [ $# -gt 0 ]; do INPUTS+=("$1"); shift; done ;;
+    -*)            die "unknown option: $1 (try -h)" ;;
+    *)             INPUTS+=("$1"); shift ;;
+  esac
+done
+
+command -v ffmpeg >/dev/null || die "ffmpeg not found in PATH"
+[ ${#INPUTS[@]} -gt 0 ] || { usage; exit 1; }
+[ -z "$OUTDIR" ] || mkdir -p "$OUTDIR" || die "cannot create outdir: $OUTDIR"
+
+# ---- resolve codec -> ffmpeg video args + default profile -------------------
+case "$CODEC" in
+  dnxhr)
+    : "${PROFILE:=lb}"
+    case "$PROFILE" in lb|sq|hq) ;; *) die "dnxhr profile must be lb|sq|hq" ;; esac
+    VARGS=(-c:v dnxhd -profile:v "dnxhr_$PROFILE" -pix_fmt yuv422p)
+    AARGS=(-c:a pcm_s16le)
+    ;;
+  prores)
+    : "${PROFILE:=proxy}"
+    case "$PROFILE" in proxy) pnum=0;; lt) pnum=1;; standard) pnum=2;; hq) pnum=3;;
+      *) die "prores profile must be proxy|lt|standard|hq" ;; esac
+    VARGS=(-c:v prores_ks -profile:v "$pnum" -pix_fmt yuv422p10le)
+    AARGS=(-c:a pcm_s16le)
+    ;;
+  h264)
+    : "${PROFILE:=18}"
+    [[ "$PROFILE" =~ ^[0-9]+$ ]] || die "h264 profile must be a CRF number (e.g. 18)"
+    VARGS=(-c:v libx264 -crf "$PROFILE" -preset medium -pix_fmt yuv420p)
+    AARGS=(-c:a aac -b:a 192k)
+    ;;
+  *) die "unknown codec: $CODEC (dnxhr|prores|h264)" ;;
+esac
+
+# ---- gather sources ---------------------------------------------------------
+shopt -s nullglob nocaseglob
+SRCS=()
+for in in "${INPUTS[@]}"; do
+  if [ -d "$in" ]; then
+    for f in "$in"/*.mp4 "$in"/*.mov "$in"/*.mkv "$in"/*.m4v; do SRCS+=("$f"); done
+  elif [ -f "$in" ]; then
+    SRCS+=("$in")
+  else
+    printf '%s: skip (not found): %s\n' "$prog" "$in" >&2
+  fi
+done
+shopt -u nullglob nocaseglob
+[ ${#SRCS[@]} -gt 0 ] || die "no input files found"
+
+free_gb() { df -B1G --output=avail "${OUTDIR:-.}" | tail -1 | tr -d ' '; }
+
+# ---- convert ----------------------------------------------------------------
+ok=0; failed=0; skipped=0
+printf '%s: %d source(s) | codec=%s profile=%s | hwaccel=%s\n' \
+  "$prog" "${#SRCS[@]}" "$CODEC" "${PROFILE}" "$([ $HWACCEL = 1 ] && echo on || echo off)"
+
+for src in "${SRCS[@]}"; do
+  base=${src##*/}; stem=${base%.*}
+  dir=${OUTDIR:-$(dirname -- "$src")}
+  out="$dir/$stem.mov"
+  tmp="$dir/$stem.partial.mov"
+
+  if [ "$src" = "$out" ]; then skipped=$((skipped+1)); continue; fi          # don't eat self
+  if [ -e "$out" ] && [ "$FORCE" = 0 ]; then
+    printf '  skip (exists): %s\n' "$base"; skipped=$((skipped+1)); continue
+  fi
+
+  free=$(free_gb)
+  if [ "${free:-0}" -lt "$MIN_FREE_GB" ]; then
+    printf '  STOP: %s GB free (< %s). Free space and re-run.\n' "$free" "$MIN_FREE_GB" >&2
+    break
+  fi
+
+  printf '  converting: %s  (free %s GB)\n' "$base" "$free"
+  if [ "$DRYRUN" = 1 ]; then continue; fi
+
+  hw=(); [ "$HWACCEL" = 1 ] && hw=(-hwaccel cuda)
+  run() { ffmpeg -hide_banner -nostdin -y "$@" \
+            -map 0:v:0 -map '0:a?' "${VARGS[@]}" "${AARGS[@]}" "$tmp"; }
+
+  if ffmpeg -hide_banner -nostdin -y "${hw[@]}" -i "$src" \
+       -map 0:v:0 -map '0:a?' "${VARGS[@]}" "${AARGS[@]}" "$tmp" 2>/dev/null \
+     || ffmpeg -hide_banner -nostdin -y -i "$src" \
+       -map 0:v:0 -map '0:a?' "${VARGS[@]}" "${AARGS[@]}" "$tmp"; then
+    mv -f -- "$tmp" "$out"
+    printf '    OK -> %s (%s)\n' "$out" "$(du -h -- "$out" | cut -f1)"
+    ok=$((ok+1))
+  else
+    rm -f -- "$tmp"
+    printf '    FAILED: %s (original kept)\n' "$base" >&2
+    failed=$((failed+1))
+  fi
+done
+
+printf '%s: done. %d converted, %d skipped, %d failed.\n' "$prog" "$ok" "$skipped" "$failed"
+[ "$failed" -eq 0 ]
